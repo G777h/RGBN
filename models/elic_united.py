@@ -10,25 +10,61 @@ from modules.transform import *
 from utils.ckbd import *
 from utils.moduleFunc import get_scale_table, update_registered_buffers
 
-class GGDM(nn.Module):
-    def __init__(self, c, l):
-        super().__init__()
-        self.net = nn.Sequential(nn.Conv2d(l, c, 3, 1, 1), nn.ReLU(True), nn.Conv2d(c, c, 3, 1, 1), nn.Sigmoid())
 
-    def forward(self, c_feat, l_feat):
-        g = self.net(l_feat)
+class SliceAwareGGDM(nn.Module):
+   
+    def __init__(self, slice_num, get_c_dim_fn, get_l_dim_fn, mid_ch=128):
+        super().__init__()
+        
+        self.in_l = nn.ModuleList([nn.Conv2d(get_l_dim_fn(i), mid_ch, 1) for i in range(slice_num)])
+        self.out_g = nn.ModuleList([nn.Conv2d(mid_ch, get_c_dim_fn(i), 1) for i in range(slice_num)])
+
+        self.net = nn.Sequential(
+            nn.Conv2d(mid_ch, mid_ch, 3, 1, 1, groups=mid_ch),
+            nn.ReLU(True),
+            nn.Conv2d(mid_ch, mid_ch, 3, 1, 1, groups=mid_ch),
+            nn.ReLU(True)
+        )
+
+    def forward(self, c_feat, l_feat, idx):
+        l_proj = self.in_l[idx](l_feat)               
+        g_core = self.net(l_proj)                     
+        g = torch.sigmoid(self.out_g[idx](g_core))     
+        # [Fix Issue-5] 返回 gate 加权和补充两路特征，让调用处保留互补信息
         return c_feat * g, c_feat * (1 - g)
 
-class GPF(nn.Module):
-    def __init__(self, m, a):
-        super().__init__()
-        self.adm = nn.Conv2d(m, m, 1)
-        self.ada = nn.Sequential(nn.Conv2d(a, m, 3, 1, 1), nn.LeakyReLU(0.2, True))
-        self.gate = nn.Sequential(nn.Conv2d(m * 2, m, 3, 1, 1), nn.ReLU(True), nn.Conv2d(m, m, 1), nn.Sigmoid())
 
-    def forward(self, hm, ha):
-        mp, ap = self.adm(hm), self.ada(ha)
-        return mp + self.gate(torch.cat([mp, ap], 1)) * ap
+class SliceAwareGPF(nn.Module):
+    
+    def __init__(self, slice_num, get_m_dim_fn, get_a_dim_fn, mid_ch=128):
+        super().__init__()
+        
+        self.in_m = nn.ModuleList([nn.Conv2d(get_m_dim_fn(i), mid_ch, 1) for i in range(slice_num)])
+        self.in_a = nn.ModuleList([nn.Conv2d(get_a_dim_fn(i), mid_ch, 1) for i in range(slice_num)])
+        self.out_m = nn.ModuleList([nn.Conv2d(mid_ch, get_m_dim_fn(i), 1) for i in range(slice_num)])
+
+        self.adm = nn.Conv2d(mid_ch, mid_ch, 1)
+        self.ada = nn.Sequential(
+            nn.Conv2d(mid_ch, mid_ch, 3, 1, 1, groups=mid_ch),
+            nn.LeakyReLU(0.2, True)
+        )
+        self.gate = nn.Sequential(
+            # [Fix Issue-6] 去掉 groups 限制，改用普通卷积充分混合跨模态通道
+            nn.Conv2d(mid_ch * 2, mid_ch, 3, 1, 1),  # 全通道卷积实现跨模态信息交流
+            nn.ReLU(True),
+            nn.Conv2d(mid_ch, mid_ch, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, hm, ha, idx):
+        m_proj = self.in_m[idx](hm)
+        a_proj = self.in_a[idx](ha)
+
+        mp, ap = self.adm(m_proj), self.ada(a_proj)
+        core_out = mp + self.gate(torch.cat([mp, ap], 1)) * ap
+
+        return self.out_m[idx](core_out)
+
 
 class ELIC_united(CompressionModel):
     def __init__(self, config, **kwargs):
@@ -38,7 +74,7 @@ class ELIC_united(CompressionModel):
         M = config.M
         slice_num = config.slice_num
         slice_ch = config.slice_ch
-        self.quant = config.quant  # noise or ste
+        self.quant = config.quant 
         self.slice_num = slice_num
         self.slice_ch = slice_ch
         self.g_a = AnalysisTransformEXcross(N, M, act=nn.ReLU)
@@ -59,7 +95,6 @@ class ELIC_united(CompressionModel):
             for i in range(len(slice_ch))
         )
 
-        # 因为是使用索引idx来跳过None，第一个idx，没有使用channel信息
         self.rgb_channel_context = nn.ModuleList(
             ChannelContextEX(in_dim=sum(slice_ch[:i]), out_dim=slice_ch[i] * 2, act=nn.ReLU) if i else None
             for i in range(slice_num)
@@ -69,32 +104,31 @@ class ELIC_united(CompressionModel):
             for i in range(slice_num)
         )
 
-        # --- 辅助计算主干上下文维度的闭包函数 ---
         def get_init_dim(i):
             return M * 4 + slice_ch[i] * 4 if i > 0 else M * 4
 
-        # 1. 深度图 (法向图) Anchor 步骤的融合网络
-        self.depth_anchor_gpf = nn.ModuleList(
-            GPF(m=get_init_dim(i), a=slice_ch[i] * 2) for i in range(slice_num)
-        )
+        def get_slice_ch_2(i):
+            return slice_ch[i] * 2
+            
+        def get_slice_ch_4(i):
+            return slice_ch[i] * 4
 
-        # 2. RGB Non-Anchor 步骤的双向融合网络 (包含 GGDM 与 GPF)
-        self.rgb_ggdm = nn.ModuleList(
-            GGDM(c=slice_ch[i] * 2, l=slice_ch[i] * 2) for i in range(slice_num)
-        )
-        self.rgb_nonanchor_gpf = nn.ModuleList(
-            GPF(m=get_init_dim(i), a=slice_ch[i] * 4) for i in range(slice_num)
-        )
+        # [Fix Issue-5] GGDM 返回两路特征（gate + residual 共 4ch）+ 跨模态 local_ctx (2ch) = 6ch
+        def get_slice_ch_6(i):
+            return slice_ch[i] * 6
 
-        # 3. 深度图 (法向图) Non-Anchor 步骤的双向融合网络 (包含 GGDM 与 GPF)
-        self.depth_ggdm = nn.ModuleList(
-            GGDM(c=slice_ch[i] * 2, l=slice_ch[i] * 2) for i in range(slice_num)
-        )
-        self.depth_nonanchor_gpf = nn.ModuleList(
-            GPF(m=get_init_dim(i), a=slice_ch[i] * 4) for i in range(slice_num)
-        )
+        mid_ch = 128  
 
-        # 4. 重构原本的概率参数预测网络（统一使用融合后的维度进行解码）
+        self.depth_anchor_gpf = SliceAwareGPF(slice_num, get_init_dim, get_slice_ch_2, mid_ch=mid_ch)
+
+        self.rgb_ggdm = SliceAwareGGDM(slice_num, get_slice_ch_2, get_slice_ch_2, mid_ch=mid_ch)
+        # [Fix Issue-5] 辅助输入维度由 4ch 升为 6ch
+        self.rgb_nonanchor_gpf = SliceAwareGPF(slice_num, get_init_dim, get_slice_ch_6, mid_ch=mid_ch)
+
+        self.depth_ggdm = SliceAwareGGDM(slice_num, get_slice_ch_2, get_slice_ch_2, mid_ch=mid_ch)
+        # [Fix Issue-5] 辅助输入维度由 4ch 升为 6ch
+        self.depth_nonanchor_gpf = SliceAwareGPF(slice_num, get_init_dim, get_slice_ch_6, mid_ch=mid_ch)
+
         self.rgb_entropy_parameters_anchor = nn.ModuleList(
             EntropyParametersEX(in_dim=get_init_dim(i), out_dim=slice_ch[i] * 2, act=nn.ReLU) for i in range(slice_num)
         )
@@ -128,7 +162,9 @@ class ELIC_united(CompressionModel):
         scales = split_func(scales)
         means = split_func(means)
         if self.quant == "ste":
+            # [Fix Issue-7] ste 模式同样需要 split_func 应用空间掩码，保证 anchor/nonanchor 位置正确
             slice_part = ste_round(slice_part - means) + means
+            slice_part = split_func(slice_part)  # 修复点：与 noise 模式保持一致
         else:
             slice_part = entropy_model.quantize(slice_part, "noise" if self.training else "dequantize")
             slice_part = split_func(slice_part)
@@ -158,40 +194,39 @@ class ELIC_united(CompressionModel):
         else:
             init_context = torch.cat([rgb_hyper_params, depth_hyper_params], dim=1)
 
-        ## 1. rgb anchor 编码
+        ## 1. rgb anchor
         rgb_slice_anchor, rgb_scales_anchor, rgb_means_anchor, rgb_local_ctx = self.codeOnePart(
             rgb_slice_anchor, [init_context], self.rgb_entropy_parameters_anchor[idx],
             ckbd_anchor, self.rgb_gaussian_conditional, local_context=self.rgb_local_context[idx]
         )
 
-        ## 2. depth anchor 编码 (使用 GPF 融合全局上下文与 rgb 局部先验)
-        depth_anchor_fused_ctx = self.depth_anchor_gpf[idx](init_context, rgb_local_ctx)
+        depth_anchor_fused_ctx = self.depth_anchor_gpf(init_context, rgb_local_ctx, idx)
         depth_slice_anchor, depth_scales_anchor, depth_means_anchor, depth_local_ctx = self.codeOnePart(
             depth_slice_anchor, [depth_anchor_fused_ctx], self.depth_entropy_parameters_anchor[idx],
             ckbd_anchor, self.depth_gaussian_conditional, local_context=self.depth_local_context[idx]
         )
 
-        ## 3. rgb nonanchor 编码 (使用 GGDM 解耦 RGB 纹理，再用 GPF 进行跨模态融合)
-        rgb_gated, _ = self.rgb_ggdm[idx](rgb_local_ctx, depth_local_ctx)
-        rgb_nonanchor_aux = torch.cat([rgb_gated, depth_local_ctx], dim=1)
-        rgb_nonanchor_fused_ctx = self.rgb_nonanchor_gpf[idx](init_context, rgb_nonanchor_aux)
+        rgb_gated, rgb_residual = self.rgb_ggdm(rgb_local_ctx, depth_local_ctx, idx)
+        # [Fix Issue-5] 拼接 gate加权、互补和跨模态三路信息，充分利用 GGDM 两路输出
+        rgb_nonanchor_aux = torch.cat([rgb_gated, rgb_residual, depth_local_ctx], dim=1)
+        rgb_nonanchor_fused_ctx = self.rgb_nonanchor_gpf(init_context, rgb_nonanchor_aux, idx)
 
         (rgb_slice_nonanchor, rgb_scales_nonanchor, rgb_means_nonanchor, rgb_local_ctx_nonanchor, rgb_y_hat_slice) = self.codeOnePart(
             rgb_slice_nonanchor, [rgb_nonanchor_fused_ctx], self.rgb_entropy_parameters_nonanchor[idx],
             ckbd_nonanchor, self.rgb_gaussian_conditional, anchor_part=rgb_slice_anchor, local_context=self.rgb_local_context_anchor_with_nonanchor[idx]
         )
 
-        ## 4. depth nonanchor 编码 (对称机制：法向图同样被高频 RGB 细节引导)
-        depth_gated, _ = self.depth_ggdm[idx](depth_local_ctx, rgb_local_ctx_nonanchor)
-        depth_nonanchor_aux = torch.cat([depth_gated, rgb_local_ctx_nonanchor], dim=1)
-        depth_nonanchor_fused_ctx = self.depth_nonanchor_gpf[idx](init_context, depth_nonanchor_aux)
+        depth_gated, depth_residual = self.depth_ggdm(depth_local_ctx, rgb_local_ctx_nonanchor, idx)
+        # [Fix Issue-5] 拼接 gate加权、互补和跨模态三路信息
+        depth_nonanchor_aux = torch.cat([depth_gated, depth_residual, rgb_local_ctx_nonanchor], dim=1)
+        depth_nonanchor_fused_ctx = self.depth_nonanchor_gpf(init_context, depth_nonanchor_aux, idx)
 
         (depth_slice_nonanchor, depth_scales_nonanchor, depth_means_nonanchor, depth_y_hat_slice) = self.codeOnePart(
             depth_slice_nonanchor, [depth_nonanchor_fused_ctx], self.depth_entropy_parameters_nonanchor[idx],
             ckbd_nonanchor, self.depth_gaussian_conditional, anchor_part=depth_slice_anchor
         )
 
-        ## BPP 估计
+        ## BPP
         rgb_scales_slice = ckbd_merge(rgb_scales_anchor, rgb_scales_nonanchor)
         rgb_means_slice = ckbd_merge(rgb_means_anchor, rgb_means_nonanchor)
         _, rgb_y_slice_likelihoods = self.rgb_gaussian_conditional(rgb_y_slice, rgb_scales_slice, rgb_means_slice)
@@ -265,10 +300,6 @@ class ELIC_united(CompressionModel):
 
         rgb_hat, depth_hat = self.g_s(rgb_y_hat, depth_y_hat)
 
-        # print("united forward save npy")
-        # np.save("R2D_rgb_y_li.npy", rgb_y_likelihoods.cpu().numpy())
-        # np.save("R2D_depth_y_li.npy", depth_y_likelihoods.cpu().numpy())
-
         return {
             "x_hat": {"r": rgb_hat, "d": depth_hat},
             "r_likelihoods": {"y": rgb_y_likelihoods, "z": rgb_z_likelihoods},
@@ -296,6 +327,8 @@ class ELIC_united(CompressionModel):
             rgb_channel_ctx = self.rgb_channel_context[idx](torch.cat(rgb_y_hat_slices, dim=1))
             depth_channel_ctx = self.depth_channel_context[idx](torch.cat(depth_y_hat_slices, dim=1))
             init_context = [rgb_hyper_params, depth_hyper_params, rgb_channel_ctx, depth_channel_ctx]
+            
+        init_context = torch.cat(init_context, dim=1)
 
         # rgb-anchor
         rgb_params_anchor = self.rgb_entropy_parameters_anchor[idx](init_context)
@@ -311,7 +344,7 @@ class ELIC_united(CompressionModel):
         rgb_local_ctx = self.rgb_local_context[idx](rgb_slice_anchor)
 
         # depth-anchor
-        depth_anchor_fused = self.depth_anchor_gpf[idx](init_context, rgb_local_ctx)
+        depth_anchor_fused = self.depth_anchor_gpf(init_context, rgb_local_ctx, idx)
         depth_params_anchor = self.depth_entropy_parameters_anchor[idx](depth_anchor_fused)
         depth_scales_anchor, depth_means_anchor = depth_params_anchor.chunk(2, 1)
         depth_slice_anchor = compress_anchor(
@@ -325,8 +358,9 @@ class ELIC_united(CompressionModel):
         depth_local_ctx = self.depth_local_context[idx](depth_slice_anchor)
 
         # rgb-nonanchor
-        rgb_gated, _ = self.rgb_ggdm[idx](rgb_local_ctx, depth_local_ctx)
-        rgb_nonanchor_fused = self.rgb_nonanchor_gpf[idx](init_context, torch.cat([rgb_gated, depth_local_ctx], dim=1))
+        rgb_gated, rgb_residual = self.rgb_ggdm(rgb_local_ctx, depth_local_ctx, idx)
+        # [Fix Issue-5] 拼接三路信息，与 training forward 保持一致
+        rgb_nonanchor_fused = self.rgb_nonanchor_gpf(init_context, torch.cat([rgb_gated, rgb_residual, depth_local_ctx], dim=1), idx)
         rgb_params_nonanchor = self.rgb_entropy_parameters_nonanchor[idx](rgb_nonanchor_fused)
         rgb_scales_nonanchor, rgb_means_nonanchor = rgb_params_nonanchor.chunk(2, 1)
         rgb_slice_nonanchor = compress_nonanchor(
@@ -341,9 +375,10 @@ class ELIC_united(CompressionModel):
         rgb_local_ctx_nonanchor = self.rgb_local_context_anchor_with_nonanchor[idx](rgb_y_hat_slice)
 
         # depth-nonanchor
-        depth_gated, _ = self.depth_ggdm[idx](depth_local_ctx, rgb_local_ctx_nonanchor)
-        depth_nonanchor_fused = self.depth_nonanchor_gpf[idx](init_context,
-                                                              torch.cat([depth_gated, rgb_local_ctx_nonanchor], dim=1))
+        depth_gated, depth_residual = self.depth_ggdm(depth_local_ctx, rgb_local_ctx_nonanchor, idx)
+        # [Fix Issue-5] 拼接三路信息，与 training forward 保持一致
+        depth_nonanchor_fused = self.depth_nonanchor_gpf(init_context,
+                                                         torch.cat([depth_gated, depth_residual, rgb_local_ctx_nonanchor], dim=1), idx)
         depth_params_nonanchor = self.depth_entropy_parameters_nonanchor[idx](depth_nonanchor_fused)
         depth_scales_nonanchor, depth_means_nonanchor = depth_params_nonanchor.chunk(2, 1)
         depth_slice_nonanchor = compress_nonanchor(
@@ -414,10 +449,6 @@ class ELIC_united(CompressionModel):
         return rgb_y_strings, depth_y_strings
 
     def compress(self, rgb, depth):
-        # print("united compress -> forward and exit()")
-        # self.forward(rgb, depth)
-        # exit()
-
         rgb_y, depth_y = self.g_a(rgb, depth)
         rgb_z, depth_z = self.h_a(rgb_y, depth_y)
 
@@ -444,7 +475,7 @@ class ELIC_united(CompressionModel):
         torch.cuda.synchronize()
         start_time = time.process_time()
 
-        rgb_y_strings = rgb_strings[0][0]  # 本来不需要的，只是compress写成了列表的形式
+        rgb_y_strings = rgb_strings[0][0]  
         rgb_z_strings = rgb_strings[1]
         rgb_z_hat = self.rgb_entropy_bottleneck.decompress(rgb_z_strings, shape)
         depth_y_strings = depth_strings[0][0]
@@ -486,8 +517,10 @@ class ELIC_united(CompressionModel):
             depth_channel_ctx = self.depth_channel_context[idx](torch.cat(depth_y_hat_slices, dim=1))
             init_context = [rgb_hyper_params, depth_hyper_params, rgb_channel_ctx, depth_channel_ctx]
 
-        # rgb-anchor
-        rgb_params_anchor = self.rgb_entropy_parameters_anchor[idx](torch.cat(init_context, dim=1))
+        init_context = torch.cat(init_context, dim=1)
+
+        # 2. rgb-anchor 解码
+        rgb_params_anchor = self.rgb_entropy_parameters_anchor[idx](init_context) 
         rgb_scales_anchor, rgb_means_anchor = rgb_params_anchor.chunk(2, 1)
         rgb_slice_anchor = decompress_anchor(
             self.rgb_gaussian_conditional,
@@ -500,10 +533,9 @@ class ELIC_united(CompressionModel):
         )
         rgb_local_ctx = self.rgb_local_context[idx](rgb_slice_anchor)
 
-        # depth-anchor
-        depth_params_anchor = self.depth_entropy_parameters_anchor[idx](
-            torch.cat([rgb_local_ctx] + init_context, dim=1)
-        )
+        # 3. depth-anchor 解码
+        depth_anchor_fused = self.depth_anchor_gpf(init_context, rgb_local_ctx, idx)
+        depth_params_anchor = self.depth_entropy_parameters_anchor[idx](depth_anchor_fused)
         depth_scales_anchor, depth_means_anchor = depth_params_anchor.chunk(2, 1)
         depth_slice_anchor = decompress_anchor(
             self.depth_gaussian_conditional,
@@ -515,11 +547,12 @@ class ELIC_united(CompressionModel):
             depth_offsets,
         )
         depth_local_ctx = self.depth_local_context[idx](depth_slice_anchor)
-        rgb_params_nonanchor = self.rgb_entropy_parameters_nonanchor[idx](
-            torch.cat([rgb_local_ctx, depth_local_ctx] + init_context, dim=1)
-        )
 
-        # rgb-nonanchor
+        # 4. rgb-nonanchor 解码
+        rgb_gated, rgb_residual = self.rgb_ggdm(rgb_local_ctx, depth_local_ctx, idx)
+        # [Fix Issue-5] 拼接三路信息，与 training forward 保持一致
+        rgb_nonanchor_fused = self.rgb_nonanchor_gpf(init_context, torch.cat([rgb_gated, rgb_residual, depth_local_ctx], dim=1), idx)
+        rgb_params_nonanchor = self.rgb_entropy_parameters_nonanchor[idx](rgb_nonanchor_fused)
         rgb_scales_nonanchor, rgb_means_nonanchor = rgb_params_nonanchor.chunk(2, 1)
         rgb_slice_nonanchor = decompress_nonanchor(
             self.rgb_gaussian_conditional,
@@ -531,13 +564,14 @@ class ELIC_united(CompressionModel):
             rgb_offsets,
         )
         rgb_y_hat_slice = rgb_slice_nonanchor + rgb_slice_anchor
-        rgb_local_ctx = self.rgb_local_context_anchor_with_nonanchor[idx](rgb_y_hat_slice)
+        rgb_local_ctx_nonanchor = self.rgb_local_context_anchor_with_nonanchor[idx](rgb_y_hat_slice)
         rgb_y_hat_slices.append(rgb_y_hat_slice)
 
-        # depth-nonanchor
-        depth_params_nonanchor = self.depth_entropy_parameters_nonanchor[idx](
-            torch.cat([rgb_local_ctx, depth_local_ctx] + init_context, dim=1)
-        )
+        # 5. depth-nonanchor 解码
+        depth_gated, depth_residual = self.depth_ggdm(depth_local_ctx, rgb_local_ctx_nonanchor, idx)
+        # [Fix Issue-5] 拼接三路信息，与 training forward 保持一致
+        depth_nonanchor_fused = self.depth_nonanchor_gpf(init_context, torch.cat([depth_gated, depth_residual, rgb_local_ctx_nonanchor], dim=1), idx)
+        depth_params_nonanchor = self.depth_entropy_parameters_nonanchor[idx](depth_nonanchor_fused)
         depth_scales_nonanchor, depth_means_nonanchor = depth_params_nonanchor.chunk(2, 1)
         depth_slice_nonanchor = decompress_nonanchor(
             self.depth_gaussian_conditional,
@@ -595,7 +629,7 @@ class ELIC_united(CompressionModel):
             scale_table = get_scale_table()
         rgb_updated = self.rgb_gaussian_conditional.update_scale_table(scale_table, force=force)
         depth_updated = self.depth_gaussian_conditional.update_scale_table(scale_table, force=force)
-        updated = rgb_updated & depth_updated | super().update(force=force)  # 更新entropybottleneck
+        updated = rgb_updated & depth_updated | super().update(force=force)  
         return updated
 
     def load_state_dict(self, state_dict, strict=False):
@@ -623,11 +657,15 @@ class ELIC_united(CompressionModel):
             ["_quantized_cdf", "_offset", "_cdf_length"],
             state_dict,
         )
-        try:
-            super().load_state_dict(state_dict, strict=True)
-            print("ELIC_united load state dict strict success.")
-        except Exception as e:
-            import traceback
-            traceback.print_exc(e)
-            print("ELIC_united load state dict strict error.")
-            super().load_state_dict(state_dict, strict=False)
+        
+        result = nn.Module.load_state_dict(self, state_dict, strict=strict)
+        if strict:
+           print("ELIC_united load state dict strict=True success.")
+        else:
+           print("ELIC_united load state dict strict=False success (missing keys allowed).")
+
+        if result is None:
+           print("ERROR: nn.Module.load_state_dict just returned None! This should never happen.")
+           raise RuntimeError("nn.Module.load_state_dict returned None")
+        print(f"Type of result: {type(result)}, missing_keys count: {len(result.missing_keys)}, unexpected_keys count: {len(result.unexpected_keys)}")
+        return result
