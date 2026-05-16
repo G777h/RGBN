@@ -91,7 +91,6 @@ class Trainer:
         parameters = {n for n, p in self.net.named_parameters() if not n.endswith(".quantiles") and p.requires_grad}
         aux_parameters = {n for n, p in self.net.named_parameters() if n.endswith(".quantiles") and p.requires_grad}
 
-        # Make sure we don't have an intersection of parameters
         params_dict = dict(self.net.named_parameters())
         inter_params = parameters & aux_parameters
         union_params = parameters | aux_parameters
@@ -99,8 +98,15 @@ class Trainer:
         assert len(inter_params) == 0
         assert len(union_params) - len(params_dict.keys()) == 0
 
-        optimizer = optim.Adam((params_dict[n] for n in sorted(parameters)), lr=self.learning_rate)
-        aux_optimizer = optim.Adam((params_dict[n] for n in sorted(aux_parameters)), lr=self.aux_learning_rate)
+        main_params = [params_dict[n] for n in sorted(parameters)]
+        
+        optimizer = optim.Adam(main_params, lr=self.learning_rate)
+        
+        aux_optimizer = optim.Adam(
+            (params_dict[n] for n in sorted(aux_parameters)), 
+            lr=1e-3
+        )
+        
         return optimizer, aux_optimizer
 
     def get_lr_scheduler(self, ls_name):
@@ -160,24 +166,7 @@ class Trainer:
         logger_val = logging.getLogger("val")
         tb_logger = SummaryWriter(log_dir="../tb_logger/" + exp_name)
         return logger_train, logger_val, tb_logger
-
-    def restore(self, ckpt_path=None, restore_epoch=0):
-        if ckpt_path is None:
-            return 0
-        checkpoint = torch.load(ckpt_path, "cuda")
-        self.net.load_state_dict(checkpoint["state_dict"])
-        self.net.update(force=True)
-        self.net = self.net.to(self.device)
-        if restore_epoch != 0:
-            for _ in range(restore_epoch):
-                self.lr_scheduler.step()
-            return restore_epoch
-
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
-        self.aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
-        self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-        return checkpoint["epoch"]
-
+        
     def fit(self, seed=None, auto_restore=False, ckpt_path=None, restore_epoch=0):
         if seed is not None:
             self.setup_seed(seed)
@@ -206,6 +195,46 @@ class Trainer:
             elif isinstance(self.lr_scheduler, optim.lr_scheduler.ReduceLROnPlateau):
                 self.lr_scheduler.step(self.cur_loss)
             self.save_ckpt(epoch)
+
+    def restore(self, ckpt_path=None, restore_epoch=0):
+        if ckpt_path is None:
+            return 0
+        checkpoint = torch.load(ckpt_path, "cuda")
+        # strict=False：允许从旧 checkpoint 恢复（新增模块如 rgb_cross_cmgm 会随机初始化）
+        # CMGM 内部 zero_conv 零初始化，冷启动安全，不会破坏已收敛的重建质量
+        load_result = self.net.load_state_dict(checkpoint["state_dict"], strict=False)
+        # ---------- 添加判空保护 ----------
+        if load_result is None:
+            if self.rank == 0:
+                self.logger_train.error("load_state_dict returned None, using empty keys to continue")
+            from collections import namedtuple
+            MockKeys = namedtuple("MockKeys", ["missing_keys", "unexpected_keys"])
+            load_result = MockKeys(missing_keys=[], unexpected_keys=[])
+        # ---------------------------------
+        if self.rank == 0:
+            if load_result.missing_keys:
+                self.logger_train.info(f"[restore] Missing keys (will init from scratch): {load_result.missing_keys}")
+            if load_result.unexpected_keys:
+                self.logger_train.info(f"[restore] Unexpected keys (ignored): {load_result.unexpected_keys}")
+        self.net.update(force=True)
+        self.net = self.net.to(self.device)
+        if restore_epoch != 0:
+            for _ in range(restore_epoch):
+                self.lr_scheduler.step()          
+            return restore_epoch
+
+        try:
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+        except (ValueError, RuntimeError):
+            if self.rank == 0:
+                self.logger_train.warning("Main optimizer doesnt match, skip loading.")
+        try:
+            self.aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
+            self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+        except (ValueError, RuntimeError):
+            pass
+
+        return checkpoint["epoch"]
 
     def save_ckpt(self, epoch, every_epoch=200):
         is_best = self.cur_loss < self.best_loss
