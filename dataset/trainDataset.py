@@ -38,31 +38,28 @@ class BaseDataset(Dataset):
         rgb_path = self.rgb_files[index]
         normal_path = self.depth_files[index]
 
-        # 1. 使用 cv2 读取 RGB (保留原始位深)
+        
         rgb_img = cv2.imread(rgb_path, cv2.IMREAD_UNCHANGED)
         if rgb_img is not None and rgb_img.ndim == 3:
-            rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB) # tif 默认 BGR 读取，转回 RGB
+            rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_BGR2RGB) 
         
-        # 2. 使用 cv2 读取 Normal 法向图
+        
         normal_img = cv2.imread(normal_path, cv2.IMREAD_UNCHANGED)
         if normal_img is not None and normal_img.ndim == 3:
             normal_img = cv2.cvtColor(normal_img, cv2.COLOR_BGR2RGB)
 
-        # 3. 动态归一化 (兼容 8-bit 的 0-255 和 16-bit 的 0-65535)
         rgb_img = rgb_img.astype(np.float32)
         rgb_img /= 65535.0 if rgb_img.max() > 255.0 else 255.0
 
         normal_img = normal_img.astype(np.float32)
         normal_img /= 65535.0 if normal_img.max() > 255.0 else 255.0
 
-        # 4. 转换维度 (H,W,C) -> (C,H,W) 并转为 Tensor
         rgb_img = rgb_img.transpose(2, 0, 1)
         normal_img = normal_img.transpose(2, 0, 1)
 
         rgb = torch.from_numpy(rgb_img).type(torch.FloatTensor)
         normal = torch.from_numpy(normal_img).type(torch.FloatTensor)
 
-        # 5. 空间对齐的数据增强
         if self.train:
             i, j, h, w = transforms.RandomCrop.get_params(rgb, output_size=(256, 256))
             rgb = TF.crop(rgb, i, j, h, w)
