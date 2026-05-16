@@ -18,7 +18,7 @@ class Channel_aligner(nn.Module):
 
         self.conv2 = conv3x3(256, 64)
         self.conv3 = conv3x3(256, 64)
-        self.avgpool1 = nn.AdaptiveAvgPool2d(1)  # adaptive的参数是输出的size，而普通的参数则是过程的kernel_size
+        self.avgpool1 = nn.AdaptiveAvgPool2d(1)  
         self.avgpool2 = nn.AdaptiveAvgPool2d(1)
 
     # feature2 is guided
@@ -35,8 +35,8 @@ class Channel_aligner(nn.Module):
         out2 = self.conv3(out2)
         gamma = self.avgpool2(out2)
 
-        # 池化==》广播
-        out = gamma * identity + beta  # 这里是否直接通过乘法和加法来实现？ # 这里通过广播来实现？
+        # 池化to广播
+        out = gamma * identity + beta  
         # print("beta,gamma:")
         # print(beta,gamma)
-        return out, beta, gamma  # 计算bpp的时候需要，但是优化的时候不需要，因为损失加上一个常数不重要
+        return out, beta, gamma  
