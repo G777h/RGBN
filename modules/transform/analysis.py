@@ -30,8 +30,8 @@ class AnalysisTransformEX(nn.Module):
     def __init__(self, N, M, ch=3, act=nn.ReLU):
         super().__init__()
         self.analysis_transform = nn.Sequential(
-            conv(ch, N),  # 通过卷积进行下采样
-            ResidualBottleneck(N, act=act),  # 通过残差块来增强特征
+            conv(ch, N),  
+            ResidualBottleneck(N, act=act),  
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             conv(N, N),
@@ -44,7 +44,7 @@ class AnalysisTransformEX(nn.Module):
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             conv(N, M),
-            AttentionBlock(M),  # 通过通道注意力，进一步增强特征
+            AttentionBlock(M),  
         )
 
     def forward(self, x):
@@ -52,7 +52,6 @@ class AnalysisTransformEX(nn.Module):
         return x
 
 
-# 接受rgb和depth作为输入输出，但需要进行交互
 class AnalysisTransformEXSingle(nn.Module):
     def __init__(self, N, M, act=nn.ReLU):
         super().__init__()
@@ -112,61 +111,65 @@ class AnalysisTransformEXSingle(nn.Module):
         return rgb_y, depth_y
 
 
-# 接受rgb和depth作为输入输出，但需要进行交互
 class AnalysisTransformEXcross(nn.Module):
     def __init__(self, N, M, act=nn.ReLU):
         super().__init__()
+     
         self.rgb_analysis_transform = nn.Sequential(
             conv(3, N),
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
-            Bi_CMGM_v3(N),
-            conv(2 * N, N),
+            CMGM(N),             
+            conv(N, N),         
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             AttentionBlock(N),
-            Bi_CMGM_v3(N),
-            conv(2 * N, N),
+            CMGM(N),             
+            conv(N, N),          
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
-            Bi_CMGM_v3(N),
-            conv(2 * N, M),
+            CMGM(N),             
+            conv(N, M),          
             AttentionBlock(M),
         )
 
         self.depth_analysis_transform = nn.Sequential(
-            conv(3, N),
+            conv(3, N),          
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
-            nn.Identity(),
-            conv(2 * N, N),
+            nn.Identity(),       
+            conv(N, N),          
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             AttentionBlock(N),
-            nn.Identity(),
-            conv(2 * N, N),
+            nn.Identity(),       
+            conv(N, N),        
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
-            nn.Identity(),
-            conv(2 * N, M),
+            nn.Identity(),       
+            conv(N, M),          
             AttentionBlock(M),
         )
 
     def forward(self, rgb, depth):
         rgb_y = rgb
         depth_y = depth
+        
         for num, (rgb_bk, depth_bk) in enumerate(zip(self.rgb_analysis_transform, self.depth_analysis_transform)):
-            if isinstance(rgb_bk, Bi_CMGM_v3):
-                depth_y = depth_bk(depth_y)
-                rgb_f, depth_f = rgb_bk(rgb_y, depth_y)
-                rgb_y = torch.cat((rgb_y, rgb_f), dim=-3)
-                depth_y = torch.cat((depth_y, depth_f), dim=-3)
+            if isinstance(rgb_bk, CMGM):
+                # [Fix Issue-1] RGB 路径在 CMGM 位置 pass-through（CMGM 不修改 RGB）
+                # depth_bk 是 nn.Identity()，先让 Depth 正常走 Identity
+                # 然后叠加 CMGM 生成的跨模态增量
+                depth_delta = rgb_bk(rgb_feat=rgb_y, norm_feat=depth_y)
+                depth_y = depth_bk(depth_y)        # Identity pass-through
+                depth_y = depth_y + depth_delta    # 残差注入 RGB→Depth 信息
+                # rgb_y 在此处保持不变（CMGM 是单向 RGB→Depth）
             else:
                 rgb_y = rgb_bk(rgb_y)
                 depth_y = depth_bk(depth_y)
@@ -240,3 +243,6 @@ class HyperAnalysisEXcross(nn.Module):
         rgb = self.rgb_reduction(rgb)
         depth = self.depth_reduction(depth)
         return rgb, depth
+
+
+    
