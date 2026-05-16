@@ -6,6 +6,7 @@ sys.path.append("..")  # cd xx/playground
 import os
 from pprint import pprint
 
+# pyrefly: ignore [missing-import]
 import torch
 from utils.IOutils import saveImg
 from utils.metrics import AverageMeter, compute_metrics
@@ -18,56 +19,59 @@ class TrainerUnited(Trainer):
     def __init__(self, args, model_config) -> None:
         super().__init__(args, model_config)
         self.criterion = RateDistortionLossUnited(
-            quality=args.quality, distortionLossForDepth=args.distortionLossForDepth, warmup_step=args.warmup_step
+            quality=args.quality,
+            distortionLossForDepth=args.distortionLossForDepth,
+            warmup_step=args.warmup_step,
+            rgb_warmup_step=0,   # RGB 感知损失从第 1 步就启用（可通过参数扩展）
         )
-
     def train_backward_and_log(self, out_criterion, clip_max_norm, i, epoch, current_step):
         out_criterion["loss"].backward()
-        if self.debug:
-            grads = {}
-            data = {}
-            for name, param in self.net.named_parameters():
-                if param.grad is None:
-                    print(name)
-                # if param.requires_grad and param.grad is not None:
-                #     grads[name] = param.grad.mean()
-                #     data[name] = param.data.mean()
-            exit()
-
+        
         if clip_max_norm > 0:
             torch.nn.utils.clip_grad_norm_(self.net.parameters(), clip_max_norm)
         self.optimizer.step()
+        
+        # [Fix Issue-11] aux_loss 在主 loss backward 后立即计算，但 optimizer 已 step
+        # 改为：aux_optimizer.zero_grad 在训练循环处已清空，直接调用 aux backward 即可
+        # 这里对 entropy bottleneck 参数独立优化，不依赖主干纰
+        self.aux_optimizer.zero_grad()
         aux_loss = self.net.aux_loss()
         aux_loss.backward()
         self.aux_optimizer.step()
 
         current_step += 1
+        
         if (current_step % 100 == 0 or self.debug) and self.rank == 0:
-            self.tb_logger.add_scalar("{}".format("[train]: loss"), out_criterion["loss"].item(), current_step)
-            self.tb_logger.add_scalar(
-                "{}".format("[train]: rbpp_loss"), out_criterion["r_bpp_loss"].item(), current_step
-            )
-            self.tb_logger.add_scalar(
-                "{}".format("[train]: dbpp_loss"), out_criterion["d_bpp_loss"].item(), current_step
-            )
-            self.tb_logger.add_scalar(
-                "{}".format("[train]: rmse_loss"), out_criterion["r_mse_loss"].item(), current_step
-            )
-            self.tb_logger.add_scalar("{}".format("[train]: d_loss"), out_criterion["d_loss"].item(), current_step)
+            self.tb_logger.add_scalar("[train]: loss", out_criterion["loss"].item(), current_step)
+            self.tb_logger.add_scalar("[train]: rbpp_loss", out_criterion["r_bpp_loss"].item(), current_step)
+            self.tb_logger.add_scalar("[train]: dbpp_loss", out_criterion["d_bpp_loss"].item(), current_step)
+            self.tb_logger.add_scalar("[train]: rmse_loss", out_criterion["r_mse_loss"].item(), current_step)
+            self.tb_logger.add_scalar("[train]: d_pure_mse", out_criterion["d_pure_mse"].item(), current_step)
+            if "d_loss" in out_criterion:
+                self.tb_logger.add_scalar("[train]: d_loss", out_criterion["d_loss"].item(), current_step)
+            # 新增 RGB 感知损失监控
+            if "r_perc_loss" in out_criterion:
+                self.tb_logger.add_scalar("[train]: r_perc_loss", out_criterion["r_perc_loss"].item(), current_step)
+                self.tb_logger.add_scalar("[train]: r_ssim_loss", out_criterion["r_ssim_loss"].item(), current_step)
 
         if (i % 100 == 0 or self.debug) and self.rank == 0:
+            d_loss_str = f'{out_criterion["d_loss"].item():.4f}' if "d_loss" in out_criterion else "Warmup(MSE)"
+            r_perc_str = f'{out_criterion["r_perc_loss"].item():.4f}' if "r_perc_loss" in out_criterion else "MSE"
             self.logger_train.info(
                 f"Train epoch {epoch}: ["
                 f"{i*self.train_dataloader.batch_size:5d}/{len(self.train_dataloader.dataset)}"
                 f" ({100. * i / len(self.train_dataloader):.0f}%)] "
                 f'Loss: {out_criterion["loss"].item():.4f} | '
-                f'rMSE loss: {out_criterion["r_mse_loss"].item():.4f} | '
-                f'rBpp loss: {out_criterion["r_bpp_loss"].item():.4f} | '
-                f'dBpp loss: {out_criterion["d_bpp_loss"].item():.4f} | '
-                f'd loss: {out_criterion["d_loss"].item():.2f} | '
-                f"Aux loss: {aux_loss.item():.2f}"
+                f'rMSE: {out_criterion["r_mse_loss"].item():.4f} | '
+                f'dMSE: {out_criterion["d_pure_mse"].item():.4f} | '
+                f'rBpp: {out_criterion["r_bpp_loss"].item():.4f} | '
+                f'dBpp: {out_criterion["d_bpp_loss"].item():.4f} | '
+                f'rPerc: {r_perc_str} | '
+                f'dLoss(Perc): {d_loss_str} | '
+                f"Aux: {aux_loss.item():.2f}"
             )
         return current_step
+
 
     def forward(self, d):
         rgb = d[0].to(self.device)
@@ -104,7 +108,9 @@ class TrainerUnited(Trainer):
         avgMeter["d_bpp_loss"].update(out_criterion["d_bpp_loss"])
         avgMeter["loss"].update(out_criterion["loss"])
         avgMeter["r_mse_loss"].update(out_criterion["r_mse_loss"])
-        avgMeter["d_loss"].update(out_criterion["d_loss"])
+        # d_loss 仅在感知损失阶段存在，warmup 期间用 d_pure_mse 代替
+        d_loss_val = out_criterion.get("d_loss", out_criterion.get("d_pure_mse", out_criterion["loss"]))
+        avgMeter["d_loss"].update(d_loss_val)
 
         rec_r = rec["r"].clamp_(0, 1)
         p, m = compute_metrics(rec_r, gt[0])
