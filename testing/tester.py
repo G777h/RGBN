@@ -95,6 +95,7 @@ class Tester:
             os.makedirs(d, exist_ok=True)
 
     def init_logger(self, exp_dir_path, exp_name, epoch):
+        os.makedirs(exp_dir_path, exist_ok=True)
         log_level = logging.DEBUG if self.debug else logging.INFO
         print(f"test_epoch{epoch}" + exp_name)
         setup_logger("test", exp_dir_path, f"test_epoch{epoch}_" + exp_name, level=log_level)
