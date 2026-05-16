@@ -22,7 +22,6 @@ class bi_spf_single(nn.Module):
         self.d_act = nn.ReLU()
         self.d_esa = ESA(N)
 
-    # 仅仅辅助第二个
     def forward(self, rgb, depth):
         rgb = self.r_ext(rgb)
         rgb = self.r_act(rgb)
@@ -49,11 +48,10 @@ class bi_spf(bi_spf_single):
         return r, d
 
 
-# rgb和depth根据空间均值来进行通道加权【通过全局池化来实现】
 class SE_Block(nn.Module):
     def __init__(self, ch_in, reduction=16):
         super(SE_Block, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # 全局自适应池化
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)  
         self.fc = nn.Sequential(
             nn.Linear(ch_in, ch_in // reduction, bias=False),
             nn.ReLU(inplace=True),
@@ -97,76 +95,39 @@ class ESA(nn.Module):
 
         return x * m
 
-class CMGM_v3_core(nn.Module):
-    def __init__(self, in_channels, reduction_ratio=8):
-        super().__init__()
-        mid_channels = max(8, in_channels // reduction_ratio)
-
-        # 表面对齐感知预测器 (Offset Predictor)
-        self.offset_predictor = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(mid_channels, 18, 3, padding=1)
-        )
-        nn.init.zeros_(self.offset_predictor[-1].weight)
-        nn.init.zeros_(self.offset_predictor[-1].bias)
-
-        self.deformable_conv = ops.DeformConv2d(in_channels, in_channels, kernel_size=3, padding=1)
-
-        self.source_compress = nn.Conv2d(in_channels, mid_channels, 1)
-        self.target_compress = nn.Conv2d(in_channels, mid_channels, 1)
-
-        self.fusion_proj = nn.Sequential(
-            nn.Conv2d(mid_channels * 2, in_channels, 1),
-            nn.GELU()
-        )
-
-        self.output_proj = nn.Conv2d(in_channels, in_channels, 3, padding=1)
-        self.alpha = nn.Parameter(torch.zeros(1))
-
-    def compute_physical_cosine_gate(self, target_feat):
-        norm_vec = F.normalize(target_feat, p=2, dim=1)
-        sim_x = F.cosine_similarity(norm_vec[:, :, :, :-1], norm_vec[:, :, :, 1:], dim=1)
-        sim_y = F.cosine_similarity(norm_vec[:, :, :-1, :], norm_vec[:, :, 1:, :], dim=1)
-        sim_x = F.pad(sim_x, (0, 1, 0, 0), value=1.0)
-        sim_y = F.pad(sim_y, (0, 0, 0, 1), value=1.0)
-        physical_gate = F.relu((sim_x + sim_y) / 2.0).unsqueeze(1)
-        return physical_gate
-
-    def forward(self, source_feat, target_feat):
-        # 漏斗梯度先验
-        source_prior = source_feat.detach() * 0.9 + source_feat * 0.1
-
-        # 表面对齐感知与可变形卷积
-        offsets = self.offset_predictor(target_feat)
-        aligned_source = self.deformable_conv(source_prior, offsets)
-
-        # 物理门控截断
-        physical_gate = self.compute_physical_cosine_gate(target_feat)
-        gated_aligned_source = aligned_source * physical_gate
-
-        # 特征压缩与融合
-        source_comp = self.source_compress(gated_aligned_source)
-        target_comp = self.target_compress(target_feat)
-        fused = self.fusion_proj(torch.cat([source_comp, target_comp], dim=1))
-
-        output = self.output_proj(fused)
-        # 注意：这里直接返回 delta 特征，交给外部的 torch.cat 进行拼接
-        return self.alpha * output
-
-
-class Bi_CMGM_v3(nn.Module):
-    """双向封装：用于完美替换原代码的 bi_spf"""
-
+class CMGM(nn.Module):
+    """
+    Cross-Modal Multi-scale Gating Module (单向辅助：RGB -> Normal)
+    实现方案 A: G = Sigmoid( sum(DWConv_i(F_n)) )
+    """
     def __init__(self, in_channels):
         super().__init__()
-        # RGB 作为 source 引导 Normal (即 Normal 吸取 RGB 特征)
-        self.rgb_to_norm = CMGM_v3_core(in_channels)
-        # Normal 作为 source 引导 RGB (即 RGB 吸取 Normal 特征)
-        self.norm_to_rgb = CMGM_v3_core(in_channels)
+        # 1. 多尺度空间上下文提取 (使用 groups=in_channels 实现 DWConv 深度可分离卷积)
+        # Scale 1: 感受野 3x3 (dilation=1)
+        self.dwconv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, dilation=1, groups=in_channels)
+        # Scale 2: 感受野 5x5 (dilation=2)
+        self.dwconv2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=2, dilation=2, groups=in_channels)
+        # Scale 3: 感受野 7x7 (dilation=3)
+        self.dwconv3 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=3, dilation=3, groups=in_channels)
+        
+        # 2. 零初始化卷积 (冷启动保护)
+        self.zero_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        nn.init.zeros_(self.zero_conv.weight)
+        nn.init.zeros_(self.zero_conv.bias)
 
-    def forward(self, rgb_y, depth_y):
-        # 输出的分别为 RGB分支 和 Normal分支 的增量特征
-        norm_f = self.rgb_to_norm(source_feat=rgb_y, target_feat=depth_y)
-        rgb_f = self.norm_to_rgb(source_feat=depth_y, target_feat=rgb_y)
-        return rgb_f, norm_f
+    def forward(self, rgb_feat, norm_feat):
+        # 1. Target (Normal) 分支生成多尺度感知特征
+        g1 = self.dwconv1(norm_feat)
+        g2 = self.dwconv2(norm_feat)
+        g3 = self.dwconv3(norm_feat)
+        
+        # 2. 方案 A: 融合特征后计算 Sigmoid 生成跨模态门控 (Mask)
+        gate = torch.sigmoid(g1 + g2 + g3)
+        
+        # 3. 门控筛选 Source (RGB) 分支，严格压制与几何无关的纹理噪声
+        modulated_rgb = rgb_feat * gate
+        
+        # 4. 零卷积输出最终的特征增量 (Delta)
+        norm_delta = self.zero_conv(modulated_rgb)
+        
+        return norm_delta
