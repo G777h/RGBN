@@ -1,17 +1,65 @@
 import os
 import time
+import math
 import numpy as np
 import cv2
 import torch
+import torch.nn.functional as F
 from dataset.testDataset import ImageFolderUnited
 from dataset.utils import *
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from utils.IOutils import *
-from utils.metrics import AverageMeter, compute_metrics
+from utils.metrics import AverageMeter
 
 from .tester_single import TesterSingle
+import lpips
+from DISTS_pytorch import DISTS
+from pytorch_msssim import ms_ssim
 
+# ==================== Êñ∞Â¢ûÔºöMask Â§ÑÁêÜ‰∏é Masked ÊåáÊ†áËÆ°ÁÆóÂáΩÊï∞ ====================
+def read_mask_tensor(filepath, target_shape, device):
+    
+    if not os.path.exists(filepath):
+        print(f"[Warning] Mask not found: {filepath}. Using full mask.")
+        return torch.ones(target_shape, device=device)
+
+    mask = cv2.imread(filepath, cv2.IMREAD_GRAYSCALE)
+    mask = mask.astype(np.float32) / 255.0
+    mask = (mask > 0.5).astype(np.float32)
+    tensor = torch.tensor(mask.copy(), dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    return tensor.to(device)
+
+def compute_masked_psnr(pred, target, mask):
+    
+    diff = (pred - target) * mask
+    valid_pixels = mask.sum() * pred.size(1) # ÊúâÊïàÂÉèÁ¥†Êï∞ * ÈÄöÈÅìÊï∞
+    
+    if valid_pixels == 0:
+        return 0.0
+        
+    mse = torch.sum(diff ** 2) / valid_pixels
+    if mse == 0:
+        return 100.0
+    return -10 * math.log10(mse)
+
+def compute_masked_mae(pred, target, mask):
+    
+    pred_vec = pred * 2.0 - 1.0
+    target_vec = target * 2.0 - 1.0
+
+    pred_norm = F.normalize(pred_vec, p=2, dim=1, eps=1e-8)
+    target_norm = F.normalize(target_vec, p=2, dim=1, eps=1e-8)
+
+    cos_sim = torch.sum(pred_norm * target_norm, dim=1, keepdim=True)
+    cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
+    angular_error_deg = torch.rad2deg(torch.acos(cos_sim))
+
+    valid_errors = angular_error_deg[mask.bool().expand_as(angular_error_deg)]
+    if valid_errors.numel() == 0:
+        return 0.0
+    return torch.mean(valid_errors).item()
+# =========================================================================
 
 class TesterUnited(TesterSingle):
     def __init__(self, args, model_config) -> None:
@@ -27,123 +75,152 @@ class TesterUnited(TesterSingle):
         return {
             "avg_rgb_psnr": AverageMeter(),
             "avg_rgb_ms_ssim": AverageMeter(),
+            "avg_rgb_lpips": AverageMeter(),
+            "avg_rgb_dists": AverageMeter(),
             "avg_rgb_bpp": AverageMeter(),
             "avg_depth_psnr": AverageMeter(),
             "avg_depth_ms_ssim": AverageMeter(),
+            "avg_depth_lpips": AverageMeter(),
+            "avg_depth_dists": AverageMeter(),
+            "avg_depth_mae": AverageMeter(),  # Êñ∞Â¢ûÔºöÊ≥ïÁ∫øÂõæ‰∏ìÁî®ÁöÑ MAE
             "avg_depth_bpp": AverageMeter(),
             "avg_deocde_time": AverageMeter(),
             "avg_encode_time": AverageMeter(),
         }
 
-    def updateAvgMeter(self, avgMeter, rgb_p, rgb_m, rgb_bpp, depth_p, depth_m, depth_bpp, dec_time, enc_time):
+    def updateAvgMeter(self, avgMeter, rgb_p, rgb_m, rgb_l, rgb_d, rgb_bpp, 
+                       depth_p, depth_m, depth_l, depth_d, depth_mae, depth_bpp, dec_time, enc_time):
         avgMeter["avg_rgb_psnr"].update(rgb_p)
         avgMeter["avg_rgb_ms_ssim"].update(rgb_m)
+        avgMeter["avg_rgb_lpips"].update(rgb_l)
+        avgMeter["avg_rgb_dists"].update(rgb_d)
         avgMeter["avg_rgb_bpp"].update(rgb_bpp)
+        
         avgMeter["avg_depth_psnr"].update(depth_p)
         avgMeter["avg_depth_ms_ssim"].update(depth_m)
+        avgMeter["avg_depth_lpips"].update(depth_l)
+        avgMeter["avg_depth_dists"].update(depth_d)
+        avgMeter["avg_depth_mae"].update(depth_mae)  # Êõ¥Êñ∞ MAE
         avgMeter["avg_depth_bpp"].update(depth_bpp)
+        
         avgMeter["avg_deocde_time"].update(dec_time)
         avgMeter["avg_encode_time"].update(enc_time)
 
     @torch.no_grad()
     def test_model(self, padding_mode="reflect0", padding=True):
         self.net.eval()
+        
+        self.logger_test.info("Loading LPIPS and DISTS models...")
+        self.lpips_fn = lpips.LPIPS(net='alex').to(self.device).eval()
+        self.dists_fn = DISTS().to(self.device).eval()
+        
         avgMeter = self.getAvgMeter()
         rec_dir = self.get_rec_dir(padding=padding, padding_mode=padding_mode)
+        
+        # ËÆæÂÆö Mask Â≠òÊîæÁöÑÁªùÂØπË∑ØÂæÑ
+        mask_root = "/data1/Qihao_data/data/pswild/mask/"
 
         for i, (rgb, depth, rgb_img_name, depth_img_name) in enumerate(self.test_dataloader):
             B, C, H, W = rgb.shape
 
             rgb = rgb.to(self.device)
             depth = depth.to(self.device)
+            
+            # --- ËØªÂèñÂØπÂ∫îÁöÑ Mask ---
+            mask_name = f"{rgb_img_name[0]}_mask.png"  
+            mask_file = os.path.join(mask_root, mask_name)
+            mask = read_mask_tensor(mask_file, (1, 1, H, W), self.device)
 
             rgb_pad = pad(rgb, padding_mode)
             depth_pad = pad(depth, padding_mode)
             rgb_stream_path = os.path.join(rec_dir, "depth_bin")
             depth_stream_path = os.path.join(rec_dir, "rgb_bin")
+            
             rgb_bpp, depth_bpp, enc_time = self.compress_one_image_united(
                 x=(rgb_pad, depth_pad),
                 stream_path=(rgb_stream_path, depth_stream_path),
-                H=H,
-                W=W,
+                H=H, W=W,
                 img_name=rgb_img_name[0],
             )
+            
             rgb_x_hat, depth_x_hat, dec_time = self.decompress_one_image_united(
                 stream_path=(rgb_stream_path, depth_stream_path), img_name=rgb_img_name[0], mode=padding_mode
             )
+            
             self.test_save_and_log_perimg(
-                i,
-                rgb_x_hat,
-                depth_x_hat,
-                rgb,
-                depth,
-                rec_dir,
-                rgb_img_name,
-                avgMeter,
-                rgb_bpp,
-                depth_bpp,
-                dec_time,
-                enc_time,
+                i, rgb_x_hat, depth_x_hat, rgb, depth, mask,  # ‰º†ÂÖ• Mask
+                rec_dir, rgb_img_name, avgMeter,
+                rgb_bpp, depth_bpp, dec_time, enc_time,
             )
+            
         self.test_finish_log(avgMeter, rec_dir)
 
-    
-
     def test_save_and_log_perimg(
-        self, i, rgb_x_hat, depth_x_hat, rgb, depth, rec_dir, img_name, avgMeter, rgb_bpp, depth_bpp, dec_time, enc_time
+        self, i, rgb_x_hat, depth_x_hat, rgb, depth, mask, rec_dir, img_name, avgMeter, rgb_bpp, depth_bpp, dec_time, enc_time
     ):
-        rgb_p, rgb_m = compute_metrics(rgb_x_hat, rgb)
-        depth_p, depth_m = compute_metrics(depth_x_hat, depth)
+        # --- 1. ‰ΩøÁî® Mask Â∞ÜËÉåÊôØÊ∏ÖÈõ∂ ---
+        rgb_masked = rgb * mask
+        rgb_x_hat_masked = rgb_x_hat * mask
+        depth_masked = depth * mask
+        depth_x_hat_masked = depth_x_hat * mask
+
+        # --- 2. ËÆ°ÁÆó Masked PSNR Âíå MAE ---
+        rgb_p = compute_masked_psnr(rgb_x_hat_masked, rgb_masked, mask)
+        depth_p = compute_masked_psnr(depth_x_hat_masked, depth_masked, mask)
+        depth_mae = compute_masked_mae(depth_x_hat_masked, depth_masked, mask)
+
+        # --- 3. ËÆ°ÁÆóÈªëËæπÂåñ MS-SSIM ---
+        rgb_m = ms_ssim(rgb_x_hat_masked, rgb_masked, data_range=1.0).item()
+        depth_m = ms_ssim(depth_x_hat_masked, depth_masked, data_range=1.0).item()
+        
+        # --- 4. ËÆ°ÁÆóÈªëËæπÂåñ LPIPS Âíå DISTS ---
+        with torch.no_grad():
+            rgb_l = self.lpips_fn((rgb_x_hat_masked * 2 - 1), (rgb_masked * 2 - 1)).item()
+            rgb_d = self.dists_fn(rgb_x_hat_masked, rgb_masked).item()
+
+            d_x_hat_3c = depth_x_hat_masked.expand(-1, 3, -1, -1) if depth_x_hat_masked.size(1) == 1 else depth_x_hat_masked
+            depth_3c = depth_masked.expand(-1, 3, -1, -1) if depth_masked.size(1) == 1 else depth_masked
+            
+            depth_l = self.lpips_fn((d_x_hat_3c * 2 - 1), (depth_3c * 2 - 1)).item()
+            depth_d = self.dists_fn(d_x_hat_3c, depth_3c).item()
+        
         r_bpp_psnr = f"{rgb_bpp:.4f}_{rgb_p:.4f}_"
         d_bpp_psnr = f"{depth_bpp:.4f}_{depth_p:.4f}_"
 
-        # 1. ±£¥Ê RGB (Õ®≥£ « 8-bit, saveImg ƒ⁄≤ø”¶∏√¥¶¿Ì¡À)
+        # Ê≥®ÊÑèÔºö‰øùÂ≠òÂõæÁâáÊó∂Ôºå‰øùÂ≠òÁöÑÊòØÂÆåÊï¥ÁöÑÊó†ÈªëËæπÈáçÂª∫ÂõæÔºåÊñπ‰æøËÆ∫ÊñáÂ±ïÁ§∫ÂØπÊØî
         saveImg(rgb_x_hat, os.path.join(rec_dir, "rgb_rec", f"{img_name[0]}_{r_bpp_psnr}_rec.png"))
-        
-        # 2. ±£¥Ê Normal Map (ÃÊ¥˙‘≠±æµƒ depth_x_hat)
-        # Õ¨—˘ π”√‘≠”–µƒ saveImg ¥¶¿Ì 8-bit ±£¥Ê
         saveImg(depth_x_hat, os.path.join(rec_dir, "depth_rec", f"{img_name[0]}_{d_bpp_psnr}_rec_8bit.png"))
 
-        # 3. ¥¶¿Ì 16-bit µƒ Normal Map ±£¥Ê (’‚¿Ô «‘≠œ»±®¥Ìµƒµÿ∑Ω)
         if rec_dir.find("sun") != -1:
             depth_16bit = depth_x_hat * 100000
         else:
-            # “ª∞„πÈ“ªªØª÷∏¥
-            depth_16bit = depth_x_hat * 65535.0  # ÷Æ«∞Œ“√«∏ƒŒ™¡À≥˝“‘ 65535£¨’‚¿Ô–Ë“™∂‘”¶≥Àªÿ¿¥
+            depth_16bit = depth_x_hat * 65535.0  
             
-        # [∫À–ƒ–ﬁ∏¥]: ¥¶¿Ì 3 Õ®µ¿ Tensor
-        # 1. »°≥ˆµ⁄“ª’≈Õº [0]
-        # 2. ◊™ªª…Ë±∏≤¢◊™ªªŒ™ NumPy  ˝◊È
-        # 3. œﬁ÷∆ ˝÷µ∑∂Œß≤¢◊™Œ™ uint16
-        # 4. Transpose (C, H, W) -> (H, W, C)
         depth_numpy = depth_16bit[0].cpu().numpy()
         depth_numpy = np.clip(depth_numpy, 0, 65535).astype(np.uint16)
         
         if depth_numpy.ndim == 3 and depth_numpy.shape[0] == 3:
             depth_numpy = np.transpose(depth_numpy, (1, 2, 0))
-            # ◊™Œ™ BGR π© OpenCV ’˝»∑±£¥Ê—’…´
             depth_numpy = cv2.cvtColor(depth_numpy, cv2.COLOR_RGB2BGR)
         elif depth_numpy.ndim == 3 and depth_numpy.shape[0] == 1:
-            # ºÊ»›»Áπ˚»∑ µ ‰»Î¡Àµ•Õ®µ¿…Ó∂»Õºµƒ«Èøˆ
             depth_numpy = depth_numpy.squeeze()
 
         self.logger_test.debug("16bit depth/normal:")
         self.logger_test.debug(str(os.path.join(rec_dir, "depth_rec", f"{img_name[0]}_rec_16bit.png")))
-        
-        # –¥»ÎŒƒº˛
         cv2.imwrite(os.path.join(rec_dir, "depth_rec", f"{img_name[0]}_{d_bpp_psnr}_rec_16bit.png"), depth_numpy)
 
-        self.updateAvgMeter(avgMeter, rgb_p, rgb_m, rgb_bpp, depth_p, depth_m, depth_bpp, dec_time, enc_time)
+        # ‰º†ÈÄíÂåÖÂê´ depth_mae ÁöÑÊõ¥Êñ∞ÊåáÊ†á
+        self.updateAvgMeter(avgMeter, rgb_p, rgb_m, rgb_l, rgb_d, rgb_bpp, 
+                            depth_p, depth_m, depth_l, depth_d, depth_mae, depth_bpp, dec_time, enc_time)
+        
         self.logger_test.info(
             f"Image[{i}:{img_name[0]}] | "
-            f"rBpp loss: {rgb_bpp:.4f} | "
-            f"dBpp loss: {depth_bpp:.4f} | "
-            f"rPSNR: {rgb_p:.4f} | "
-            f"dPSNR: {depth_p:.4f} | "
-            f"rMS-SSIM: {rgb_m:.4f} | "
-            f"dMS-SSIM: {depth_m:.4f} | "
-            f"Encoding Latency: {enc_time:.4f} | "
-            f"Decoding latency: {dec_time:.4f}"
+            f"rBpp: {rgb_bpp:.4f} | dBpp: {depth_bpp:.4f} | "
+            f"rPSNR: {rgb_p:.4f} | dPSNR: {depth_p:.4f} | "
+            f"rMS-SSIM: {rgb_m:.4f} | dMS-SSIM: {depth_m:.4f} | "
+            f"rLPIPS: {rgb_l:.4f} | dLPIPS: {depth_l:.4f} | " 
+            f"rDISTS: {rgb_d:.4f} | dDISTS: {depth_d:.4f} | "
+            f"dMAE: {depth_mae:.4f}"
         )
 
     def test_finish_log(self, avgMeter, rec_dir):
@@ -155,6 +232,11 @@ class TesterUnited(TesterSingle):
             f"Avg dPSNR: {avgMeter['avg_depth_psnr'].avg:.7f} | "
             f"Avg rMS-SSIM: {avgMeter['avg_rgb_ms_ssim'].avg:.7f} | "
             f"Avg dMS-SSIM: {avgMeter['avg_depth_ms_ssim'].avg:.7f} | "
+            f"Avg rLPIPS: {avgMeter['avg_rgb_lpips'].avg:.7f} | "   
+            f"Avg dLPIPS: {avgMeter['avg_depth_lpips'].avg:.7f} | " 
+            f"Avg rDISTS: {avgMeter['avg_rgb_dists'].avg:.7f} | "   
+            f"Avg dDISTS: {avgMeter['avg_depth_dists'].avg:.7f} | "
+            f"Avg dMAE: {avgMeter['avg_depth_mae'].avg:.4f} | "     # ÊúÄÁªàÊâìÂç∞ÂùáÂÄº MAE
             f"Avg Encoding Latency: {avgMeter['avg_encode_time'].avg:.6f} | "
             f"Avg Decoding latency: {avgMeter['avg_deocde_time'].avg:.6f}"
         )
