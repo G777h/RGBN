@@ -9,6 +9,7 @@ from .attention import *
 from .spatialAligner import Spatial_aligner
 
 
+
 class SynthesisTransform(nn.Module):
     def __init__(self, N, M, channel=3):
         super().__init__()
@@ -126,57 +127,74 @@ class SynthesisTransformEXcro(nn.Module):
 class SynthesisTransformEXcross(nn.Module):
     def __init__(self, N, M, act=nn.ReLU) -> None:
         super().__init__()
+        
+        # RGB 解码器主干 (CMGM 位置占位，用于向 Normal 提供 RGB 信息)
         self.rgb_synthesis_transform = nn.Sequential(
             AttentionBlock(M),
             deconv(M, N),
-            Bi_CMGM_v3(N),
-            ResidualBottleneck(2 * N, N, act=act),
+            CMGM(N),
+            ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             deconv(N, N),
             AttentionBlock(N),
-            Bi_CMGM_v3(N),
-            ResidualBottleneck(2 * N, N, act=act),
+            CMGM(N),
+            ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             deconv(N, N),
-            Bi_CMGM_v3(N),
-            ResidualBottleneck(2 * N, N, act=act),
+            CMGM(N),
+            ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             deconv(N, 3),
         )
-        # 使用identity进行占位
+        
+        # Normal 解码器主干 (nn.Identity() 对齐 CMGM 位置)
         self.depth_synthesis_transform = nn.Sequential(
             AttentionBlock(M),
             deconv(M, N),
             nn.Identity(),
-            ResidualBottleneck(2 * N, N, act=act),
+            ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             deconv(N, N),
             AttentionBlock(N),
             nn.Identity(),
-            ResidualBottleneck(2 * N, N, act=act),
+            ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             deconv(N, N),
             nn.Identity(),
-            ResidualBottleneck(2 * N, N, act=act),
+            ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             ResidualBottleneck(N, act=act),
             deconv(N, 3),
         )
 
+        # [新增] 反向跨模态模块：Normal → RGB (3 个交互点)
+        # CMGM 接口复用：CMGM(rgb_feat=depth_hat, norm_feat=rgb_hat) 生成 rgb 的增量
+        # 零初始化确保从现有 checkpoint 继续训练时冷启动不破坏原有重建
+        self.rgb_cross_cmgm = nn.ModuleList([CMGM(N) for _ in range(3)])
+
     def forward(self, rgb, depth):
         rgb_hat = rgb
         depth_hat = depth
+        cmgm_idx = 0
+        
         for num, (rgb_bk, depth_bk) in enumerate(zip(self.rgb_synthesis_transform, self.depth_synthesis_transform)):
-            if isinstance(rgb_bk, Bi_CMGM_v3):
-                depth_hat = depth_bk(depth_hat)
-                rgb_f, depth_f = rgb_bk(rgb_hat, depth_hat)
-                rgb_hat = torch.cat((rgb_hat, rgb_f), dim=-3)
-                depth_hat = torch.cat((depth_hat, depth_f), dim=-3)
+            if isinstance(rgb_bk, CMGM):
+                # 正向：RGB → Normal 增量 (原有)
+                depth_delta = rgb_bk(rgb_feat=rgb_hat, norm_feat=depth_hat)
+                depth_hat = depth_bk(depth_hat)       # Identity pass-through
+                depth_hat = depth_hat + depth_delta
+
+                # [新增] 反向：Normal → RGB 增量
+                # 使用更新后的 depth_hat（已融入 RGB 信息）辅助 RGB 重建
+                rgb_delta = self.rgb_cross_cmgm[cmgm_idx](rgb_feat=depth_hat, norm_feat=rgb_hat)
+                rgb_hat = rgb_hat + rgb_delta
+
+                cmgm_idx += 1
             else:
                 rgb_hat = rgb_bk(rgb_hat)
                 depth_hat = depth_bk(depth_hat)
@@ -379,4 +397,3 @@ class hyper_transform_block_single(nn.Module):
             f = self.relu(f)
         return f
         
-
